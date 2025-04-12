@@ -10,6 +10,8 @@ using namespace std;
 typedef long long ll;
 
 int PX, PY, PZ, nx, ny, nz, t, processes;
+double data_dist_time, compute_time, total_time;
+vector<int> minima, maxima, total_minima, total_maxima;
 
 // utilities
 int get_data(int nx, int ny, int nz, int t, string &filename, vector<float> &data)
@@ -46,6 +48,49 @@ int get_data(int nx, int ny, int nz, int t, string &filename, vector<float> &dat
             }
         }
     }
+    infile.close();
+    return 0;
+}
+
+int get_data_binary(int nx, int ny, int nz, int t, string &filename, vector<float> &data)
+{
+    cout << "Trying to open file: " << filename << endl;
+    ifstream infile(filename, ios::binary);
+    if (!infile.is_open())
+    {
+        cerr << "Could not open binary file." << endl;
+        return 1;
+    }
+
+    size_t total_elements = nx * ny * nz * t;
+    vector<float> raw_data(total_elements);
+    // data.resize(total_elements);
+
+    // Read all data at once
+    infile.read(reinterpret_cast<char *>(raw_data.data()), total_elements * sizeof(float));
+    if (!infile)
+    {
+        cerr << "Error reading binary data." << endl;
+        return 1;
+    }
+
+    // Rearranging according to your custom layout
+    size_t linear_idx = 0;
+    for (int z = 0; z < nz; ++z)
+    {
+        for (int y = 0; y < ny; ++y)
+        {
+            for (int x = 0; x < nx; ++x)
+            {
+                for (int i = 0; i < t; ++i)
+                {
+                    size_t idx = x * (ny * nz * t) + y * (nz * t) + z * t + i;
+                    data[idx] = raw_data[linear_idx++];
+                }
+            }
+        }
+    }
+
     infile.close();
     return 0;
 }
@@ -115,7 +160,7 @@ tuple<int, int> minimax(int x, int y, int z, int time_idx, vector<vector<vector<
     return {is_min, is_max};
 }
 
-tuple<int, int> compute(vector<vector<vector<vector<float>>>> &grid, int rank)
+void compute(vector<vector<vector<vector<float>>>> &grid, int rank)
 {
     auto [start_X, end_X, start_Y, end_Y, start_Z, end_Z] = get_bounding_box(rank);
 
@@ -126,10 +171,10 @@ tuple<int, int> compute(vector<vector<vector<vector<float>>>> &grid, int rank)
     ez += (start_Z != 0);
 
     int sx = start_X != 0, sy = start_Y != 0, sz = start_Z != 0;
-    int local_minima = 0, local_maxima = 0;
-
+    // int local_minima = 0, local_maxima = 0;
     for (int time_idx = 0; time_idx < t; time_idx++)
     {
+        int local_minima = 0, local_maxima = 0;
         for (int x = sx; x < ex; x++)
         {
             for (int y = sy; y < ey; y++)
@@ -142,8 +187,11 @@ tuple<int, int> compute(vector<vector<vector<vector<float>>>> &grid, int rank)
                 }
             }
         }
+        minima[time_idx] = local_minima;
+        maxima[time_idx] = local_maxima;
     }
-    return {local_minima, local_maxima};
+    // return {local_minima, local_maxima};
+    return;
 }
 
 int main(int argc, char *argv[])
@@ -167,14 +215,15 @@ int main(int argc, char *argv[])
     processes = PX * PY * PZ;
 
     MPI_Init(&argc, &argv);
-    double start_time = MPI_Wtime(), compute_start, compute_end, total_compute = 0, comm_start, comm_end, ray_tracing_time;
+    double t_1 = MPI_Wtime(), compute_start, compute_end, total_compute = 0, comm_start, comm_end, ray_tracing_time;
 
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Status status;
+
     vector<float> data;
     vector<vector<vector<vector<float>>>> grid;
-
+    vector<float> global_minima_val(t, INT_MAX), global_maxima_val(t, INT_MIN);
     if (rank == 0)
     {
         // vector<float> data;
@@ -190,11 +239,13 @@ int main(int argc, char *argv[])
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
 
-        if (get_data(nx, ny, nz, t, filename, data))
+        if (get_data_binary(nx, ny, nz, t, filename, data))
         {
             cerr << "failed loading" << endl;
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
+        for (int i = 0; i < 20; i++)
+            cout << data[i] << endl;
 
         for (int i = 1; i < processes; i++)
         {
@@ -218,6 +269,8 @@ int main(int argc, char *argv[])
                             ll data_idx = x * (ny * nz * t) + y * (nz * t) + z * t + time_idx;
                             // cout << data[data_idx] << " ";
                             temp[temp_idx++] = data[data_idx];
+                            global_minima_val[time_idx] = min(global_minima_val[time_idx], data[data_idx]);
+                            global_maxima_val[time_idx] = max(global_maxima_val[time_idx], data[data_idx]);
                         }
                     }
                 }
@@ -281,17 +334,51 @@ int main(int argc, char *argv[])
 
         data.clear();
     }
+    double t_2 = MPI_Wtime();
 
-    auto [num_local_minima, num_local_maxima] = compute(grid, rank);
-    int total_local_maxima_count = 0, total_local_minima_count = 0;
+    minima.resize(t, 0);
+    maxima.resize(t, 0);
+    compute(grid, rank);
+    double t_3 = MPI_Wtime();
+    double local_data_dist_time = t_2 - t_1, local_total_time = t_3 - t_1, local_compute_time = t_3 - t_2;
+    if (rank == 0)
+    {
+        total_minima.resize(t), total_maxima.resize(t);
+    }
 
-    MPI_Reduce(&num_local_minima, &total_local_minima_count, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
-    MPI_Reduce(&num_local_maxima, &total_local_maxima_count, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(minima.data(), total_minima.data(), t, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(maxima.data(), total_maxima.data(), t, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    MPI_Reduce(&local_data_dist_time, &data_dist_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_total_time, &total_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_compute_time, &compute_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0)
     {
-        cout << "total number of local minima = : " << total_local_minima_count << endl;
-        cout << "total number of local maxima  = : " << total_local_maxima_count << endl;
+        string out = "output_";
+        out += (to_string(nx) + "_");
+        out += (to_string(ny) + "_");
+        out += (to_string(nz) + "_");
+        out += to_string(t);
+        out += ".txt";
+        ofstream outfile(out);
+
+        for (int i = 0; i < t; i++)
+        {
+            outfile << "( " << total_minima[i] << " , " << total_maxima[i] << " )" << endl;
+        }
+        outfile.precision(6);
+        outfile << std::fixed;
+        for (int i = 0; i < t; i++)
+        {
+            outfile << "( " << global_minima_val[i] << " , " << global_maxima_val[i] << " )" << endl;
+        }
+
+        outfile << "compute time -> " << compute_time << endl;
+        outfile << "data read and dist time -> " << data_dist_time << endl;
+        outfile << "total time -> " << total_time << endl;
+
+        outfile.close();
     }
     MPI_Finalize();
 }
